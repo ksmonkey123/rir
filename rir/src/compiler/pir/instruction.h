@@ -1091,6 +1091,11 @@ class FLI(CastType, 1, Effects::None()) {
         return hash_combine(
             hash_combine(hash_combine(tagHash(), type), arg<0>().type()), kind);
     }
+    PirType inferType(const GetType& getType) const override final {
+        if (kind == Downcast)
+            return getType(arg(0).val()) & type;
+        return type;
+    }
     void printArgs(std::ostream& out, bool tty) const override;
 };
 
@@ -1105,7 +1110,7 @@ class FLI(AsLogical, 1, Effect::Error) {
     Effects inferEffects(const GetType& getType) const override final {
         if (getType(val()).isA((PirType() | RType::logical | RType::integer |
                                 RType::real | RType::str | RType::cplx)
-                                   .notObject())) {
+                                   .noAttribs())) {
             return Effects::None();
         }
         return effects;
@@ -1134,7 +1139,7 @@ class FLI(AsInt, 1, Effect::Error) {
     bool ceil;
 
     explicit AsInt(Value* in, bool ceil_)
-        : FixedLenInstruction(PirType(RType::integer).scalar().notObject(),
+        : FixedLenInstruction(PirType(RType::integer).scalar().noAttribs(),
                               {{PirType::any()}}, {{in}}),
           ceil(ceil_) {}
 
@@ -1157,7 +1162,9 @@ class FLIE(Subassign1_1D, 4, Effects::Any()) {
 
     PirType inferType(const GetType& getType) const override final {
         return ifNonObjectArgs(
-            getType, type & (getType(val()) | getType(vector())), type);
+            getType,
+            type & (getType(vector()).mergeWithConversion(getType(val()))),
+            type);
     }
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
@@ -1178,7 +1185,9 @@ class FLIE(Subassign2_1D, 4, Effects::Any()) {
 
     PirType inferType(const GetType& getType) const override final {
         return ifNonObjectArgs(
-            getType, type & (getType(val()) | getType(vector())), type);
+            getType,
+            type & (getType(vector()).mergeWithConversion(getType(val()))),
+            type);
     }
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
@@ -1200,8 +1209,9 @@ class FLIE(Subassign1_2D, 5, Effects::Any()) {
     Value* idx2() const { return arg(3).val(); }
 
     PirType inferType(const GetType& getType) const override final {
-        return ifNonObjectArgs(getType,
-                               type & (getType(rhs()) | getType(lhs())), type);
+        return ifNonObjectArgs(
+            getType,
+            type & (getType(lhs()).mergeWithConversion(getType(rhs()))), type);
     }
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
@@ -1223,8 +1233,9 @@ class FLIE(Subassign2_2D, 5, Effects::Any()) {
     Value* idx2() const { return arg(3).val(); }
 
     PirType inferType(const GetType& getType) const override final {
-        return ifNonObjectArgs(getType,
-                               type & (getType(rhs()) | getType(lhs())), type);
+        return ifNonObjectArgs(
+            getType,
+            type & (getType(lhs()).mergeWithConversion(getType(rhs()))), type);
     }
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
@@ -1247,8 +1258,9 @@ class FLIE(Subassign1_3D, 6, Effects::Any()) {
     Value* idx3() const { return arg(4).val(); }
 
     PirType inferType(const GetType& getType) const override final {
-        return ifNonObjectArgs(getType,
-                               type & (getType(rhs()) | getType(lhs())), type);
+        return ifNonObjectArgs(
+            getType,
+            type & (getType(lhs()).mergeWithConversion(getType(rhs()))), type);
     }
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
@@ -1264,10 +1276,7 @@ class FLIE(Extract1_1D, 3, Effects::Any()) {
     Value* vec() const { return arg(0).val(); }
     Value* idx() const { return arg(1).val(); }
 
-    PirType inferType(const GetType& getType) const override final {
-        return ifNonObjectArgs(
-            getType, type & getType(vec()).subsetType(getType(idx())), type);
-    }
+    PirType inferType(const GetType& getType) const override final;
     Effects inferEffects(const GetType& getType) const override final {
         return ifNonObjectArgs(getType, effects & errorWarnVisible, effects);
     }
@@ -1390,8 +1399,8 @@ class FLIE(Extract1_3D, 5, Effects::Any()) {
 class FLI(Inc, 1, Effects::None()) {
   public:
     explicit Inc(Value* v)
-        : FixedLenInstruction(PirType(RType::integer).scalar().notObject(),
-                              {{PirType(RType::integer).scalar().notObject()}},
+        : FixedLenInstruction(PirType(RType::integer).scalar().noAttribs(),
+                              {{PirType(RType::integer).scalar().noAttribs()}},
                               {{v}}) {}
     size_t gvnBase() const override { return tagHash(); }
 };
@@ -1399,8 +1408,8 @@ class FLI(Inc, 1, Effects::None()) {
 class FLI(Dec, 1, Effects::None()) {
   public:
     explicit Dec(Value* v)
-        : FixedLenInstruction(PirType(RType::integer).scalar().notObject(),
-                              {{PirType(RType::integer).scalar().notObject()}},
+        : FixedLenInstruction(PirType(RType::integer).scalar().noAttribs(),
+                              {{PirType(RType::integer).scalar().noAttribs()}},
                               {{v}}) {}
     size_t gvnBase() const override { return tagHash(); }
 };
@@ -2184,15 +2193,6 @@ class FLIE(MaterializeEnv, 1, Effects::None()) {
   public:
     explicit MaterializeEnv(MkEnv* e)
         : FixedLenInstructionWithEnvSlot(RType::env, e) {}
-};
-
-class FLI(IsObject, 1, Effects::None()) {
-  public:
-    explicit IsObject(Value* v)
-        : FixedLenInstruction(NativeType::test, {{PirType::any()}}, {{v}}) {}
-
-    bool isTypecheck() const override final { return true; }
-    size_t gvnBase() const override { return tagHash(); }
 };
 
 class FLIE(IsEnvStub, 1, Effect::ReadsEnv) {

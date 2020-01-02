@@ -98,9 +98,10 @@ PirType::PirType(SEXP e) : flags_(defaultRTypeFlags()), t_(RTypeSet()) {
     else
         merge(TYPEOF(e));
 
-    if (!Rf_isObject(e)) {
+    if (!Rf_isObject(e))
         flags_.reset(TypeFlags::maybeObject);
-    }
+    if (fastVeceltOk(e))
+        flags_.reset(TypeFlags::maybeAttrib);
 
     if (PirType::vecs().isSuper(*this)) {
         if (Rf_length(e) == 1)
@@ -119,6 +120,7 @@ void PirType::merge(const ObservedValues& other) {
     if (other.numTypes == ObservedValues::MaxTypes) {
         *this = *this | any();
         flags_.set(TypeFlags::maybeObject);
+        flags_.set(TypeFlags::maybeAttrib);
         flags_.set(TypeFlags::maybeNotScalar);
         return;
     }
@@ -127,6 +129,8 @@ void PirType::merge(const ObservedValues& other) {
         const auto& record = other.seen[i];
         if (record.object)
             flags_.set(TypeFlags::maybeObject);
+        if (record.attribs)
+            flags_.set(TypeFlags::maybeAttrib);
         if (!record.scalar)
             flags_.set(TypeFlags::maybeNotScalar);
 

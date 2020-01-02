@@ -485,7 +485,7 @@ LdConst::LdConst(SEXP c, PirType t)
 LdConst::LdConst(SEXP c)
     : FixedLenInstruction(PirType(c)), idx(Pool::insert(c)) {}
 LdConst::LdConst(int num)
-    : FixedLenInstruction(PirType(RType::integer).scalar().notObject()),
+    : FixedLenInstruction(PirType(RType::integer).scalar().noAttribs()),
       idx(Pool::getInt(num)) {}
 
 SEXP LdConst::c() const { return Pool::get(idx); }
@@ -508,6 +508,23 @@ void Branch::printArgs(std::ostream& out, bool tty) const {
     FixedLenInstruction::printArgs(out, tty);
     out << " -> BB" << bb()->trueBranch()->id << " (if true) | BB"
         << bb()->falseBranch()->id << " (if false)";
+}
+
+PirType Extract1_1D::inferType(const GetType& getType) const {
+    auto res = ifNonObjectArgs(
+        getType, type & getType(vec()).subsetType(getType(idx())), type);
+    if (res.isA(PirType::num())) {
+        if (auto c = LdConst::Cast(idx())) {
+            if (IS_SIMPLE_SCALAR(c->c(), INTSXP)) {
+                if (INTEGER(c->c())[0] >= 1)
+                    res.setScalar();
+            } else if (IS_SIMPLE_SCALAR(c->c(), REALSXP)) {
+                if (REAL(c->c())[0] >= 1)
+                    res.setScalar();
+            }
+        }
+    }
+    return res;
 }
 
 void CastType::printArgs(std::ostream& out, bool tty) const {
