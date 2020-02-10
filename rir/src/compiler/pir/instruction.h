@@ -2108,7 +2108,19 @@ class VLIE(MkEnv, Effects::None()) {
     std::vector<SEXP> varName;
     std::vector<bool> missing;
     bool stub = false;
+    bool neverStub = false;
     int context = 1;
+
+    size_t gvnBase() const override {
+        size_t res = tagHash();
+        res = hash_combine(res, stub);
+        res = hash_combine(res, context);
+        for (auto& n : varName)
+            res = hash_combine(res, n);
+        for (auto n : missing)
+            res = hash_combine(res, (int)n);
+        return res;
+    }
 
     typedef std::function<void(SEXP name, Value* val, bool missing)> LocalVarIt;
     typedef std::function<void(SEXP name, InstrArg&, bool& missing)>

@@ -359,6 +359,16 @@ struct PirType {
         return PirType(t_.r, flags_ & ~FlagSet(TypeFlags::maybeNotScalar));
     }
 
+    RIR_INLINE constexpr PirType notT(RType t) const {
+        assert(isRType());
+        return PirType(t_.r & ~RTypeSet(t), flags_);
+    }
+
+    RIR_INLINE constexpr PirType orT(RType t) const {
+        assert(isRType());
+        return PirType(t_.r | t, flags_);
+    }
+
     RIR_INLINE constexpr PirType orNotScalar() const {
         assert(isRType());
         return PirType(t_.r, flags_ | TypeFlags::maybeNotScalar);
@@ -414,15 +424,19 @@ struct PirType {
     // Type of <this>[<idx>] or <this>[<idx>, <idx>]
     PirType subsetType(PirType idx) const {
         assert(isRType());
-        if (isA(RType::nil)) {
+        if (isA(PirType(RType::nil).orAttribs())) {
             // NULL
             return RType::nil;
         }
-        if (isA(num() | RType::str | RType::cons | RType::code)) {
+        if (isA((num() | RType::str | RType::cons | RType::code).orAttribs())) {
+            if (idx.isA(PirType(RType::str).scalar()))
+                return scalar().orAttribs();
             // e.g. c(1,2,3)[-1] returns c(2,3)
             return orNotScalar();
         } else if (isA(RType::vec)) {
-            return RType::vec;
+            return PirType(RType::vec);
+        } else if (isA(PirType(RType::vec).orAttribs())) {
+            return PirType(RType::vec).orAttribs();
         } else if (!maybeHasAttrs() && !PirType(RType::prom).isA(*this)) {
             // Something else
             return val().notMissing();
@@ -435,13 +449,13 @@ struct PirType {
     // Type of <this>[[<idx>]] or <this>[[<idx>, <idx>]]
     PirType extractType(PirType idx) const {
         assert(isRType());
-        if (isA(RType::nil)) {
+        if (isA(PirType(RType::nil).orAttribs())) {
             // NULL
             return RType::nil;
         }
-        if (isA(num() | RType::str | RType::cons | RType::code)) {
+        if (isA((num() | RType::str | RType::cons | RType::code).orAttribs())) {
             return scalar();
-        } else if (isA(RType::vec)) {
+        } else if (isA(PirType(RType::vec).orAttribs())) {
             return val().notMissing();
         } else if (!maybeObj() && !PirType(RType::prom).isA(*this)) {
             // Something else

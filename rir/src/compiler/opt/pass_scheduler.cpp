@@ -80,6 +80,7 @@ PassScheduler::PassScheduler() {
     add<TypeSpeculation>();
     add<ElideEnvSpec>();
     addDefaultOpt();
+    add<TypeSpeculation>();
     addDefaultPostPhaseOpt();
 
     add<PhaseMarker>("Phase 2: Env speculation");
@@ -111,7 +112,7 @@ PassScheduler::PassScheduler() {
 
     // ==== Phase 4) Final round of default opts
     addDefaultPrePhaseOpt();
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < 4; ++i) {
         addDefaultOpt();
         add<ElideEnvSpec>();
         add<CleanupCheckpoints>();

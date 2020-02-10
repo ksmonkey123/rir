@@ -28,8 +28,32 @@ extern Rboolean R_Visible;
 
 namespace rir {
 
+// #define PRINT_INTERP
+// #define PRINT_STACK_SIZE 10
 #ifdef PRINT_INTERP
-static void printInterp(Opcode* pc, Code* c) {
+static void printInterp(Opcode* pc, Code* c, InterpreterInstance* ctx) {
+#ifdef PRINT_STACK_SIZE
+    // Print stack
+    std::cout << "#; Stack:";
+    for (int i = 0;; i++) {
+        SEXP sexp = ostack_at(ctx, i);
+        if (sexp == nullptr)
+            break;
+        else if (i == PRINT_STACK_SIZE) {
+            std::cout << " ...";
+            break;
+        }
+        std::cout << " " << dumpSexp(sexp);
+    }
+    std::cout << "\n";
+#endif
+    // Print source
+    unsigned sidx = c->getSrcIdxAt(pc, true);
+    if (sidx != 0) {
+        SEXP src = src_pool_at(ctx, sidx);
+        std::cout << "#; " << dumpSexp(src) << "\n";
+    }
+    // Print bc
     BC bc = BC::decode(pc, c);
     std::cout << "#";
     bc.print(std::cout);
@@ -61,7 +85,7 @@ static RIR_INLINE SEXP getSrcForCall(Code* c, Opcode* pc,
 #ifdef PRINT_INTERP
 #define NEXT()                                                                 \
     (__extension__({                                                           \
-        printInterp(pc, c);                                                    \
+        printInterp(pc, c, ctx);                                               \
         goto* opAddr[static_cast<uint8_t>(advanceOpcode())];                   \
     }))
 #define LASTOP                                                                 \
@@ -375,7 +399,7 @@ void checkUserInterrupt() {
 void recordDeoptReason(SEXP val, const DeoptReason& reason) {
     Opcode* pos = (Opcode*)reason.srcCode + reason.originOffset;
     switch (reason.reason) {
-    case DeoptReason::Valuecheck: {
+    case DeoptReason::DeadBranchReached: {
         assert(*pos == Opcode::record_test_);
         ObservedTest* feedback = (ObservedTest*)(pos + 1);
         feedback->seen = ObservedTest::Both;
@@ -403,6 +427,13 @@ void recordDeoptReason(SEXP val, const DeoptReason& reason) {
         assert(feedback->taken > 0);
         break;
     }
+    case DeoptReason::EnvStubMaterialized: {
+        reason.srcCode->needsFullEnv = true;
+        break;
+    }
+    case DeoptReason::None:
+        assert(false);
+        break;
     }
 }
 
@@ -768,7 +799,9 @@ RIR_INLINE SEXP rirCall(CallContext& call, InterpreterInstance* ctx) {
 
     if (!isDeoptimizing() && !fun->unoptimizable &&
         fun->deoptCount() < pir::Parameter::DEOPT_ABANDON &&
-        ((fun->invocationCount() %
+        ((fun != table->baseline() && fun->invocationCount() >= 2 &&
+          fun->invocationCount() <= pir::Parameter::RIR_WARMUP) ||
+         (fun->invocationCount() %
           (fun->deoptCount() + pir::Parameter::RIR_WARMUP)) == 0)) {
         Assumptions given =
             addDynamicAssumptionsForOneTarget(call, fun->signature());
@@ -783,7 +816,9 @@ RIR_INLINE SEXP rirCall(CallContext& call, InterpreterInstance* ctx) {
                 // More assumptions are available than this version uses. Let's
                 // try compile a better matching version.
 #ifdef DEBUG_DISPATCH
-                std::cout << "Optimizing for new context:";
+                std::cout << "Optimizing for new context "
+                          << fun->invocationCount() << ": ";
+                Rf_PrintValue(call.ast);
                 std::cout << given << " vs " << fun->signature().assumptions
                           << "\n";
 #endif
@@ -1477,8 +1512,7 @@ bool isMissing(SEXP symbol, SEXP environment, Code* code, Opcode* pc) {
 void deoptFramesWithContext(InterpreterInstance* ctx,
                             const CallContext* callCtxt,
                             DeoptMetadata* deoptData, SEXP sysparent,
-                            size_t pos, size_t stackHeight,
-                            bool outerHasContext) {
+                            size_t pos, size_t stackHeight) {
     size_t excessStack = stackHeight;
 
     FrameInfo& f = deoptData->frames[pos];
@@ -1502,8 +1536,6 @@ void deoptFramesWithContext(InterpreterInstance* ctx,
     RCNTXT* cntxt;
     auto originalCntxt = findFunctionContextFor(deoptEnv);
     if (originalCntxt) {
-        assert(outerHasContext &&
-               "Frame with context after frame without context");
         cntxt = originalCntxt;
     } else {
         // NOTE: this assert triggers if we can't find the context of the
@@ -1557,7 +1589,7 @@ void deoptFramesWithContext(InterpreterInstance* ctx,
         // 2. Execute the inner frames
         if (!innermostFrame) {
             deoptFramesWithContext(ctx, callCtxt, deoptData, deoptEnv, pos - 1,
-                                   stackHeight, originalCntxt);
+                                   stackHeight);
         }
 
         // 3. Execute our frame
@@ -1707,13 +1739,11 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
     }
 
     if (!existingLocals) {
-#ifdef TYPED_STACK
         // Zero the region of the locals to avoid keeping stuff alive and to
         // zero all the type tags. Note: this trick does not work with the stack
         // in general, since there intermediate callees might set the type tags
         // to something else.
         memset(R_BCNodeStackTop, 0, sizeof(*R_BCNodeStackTop) * c->localsCount);
-#endif
         localsBase = R_BCNodeStackTop;
     }
     Locals locals(localsBase, c->localsCount, existingLocals);
@@ -1996,6 +2026,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
         INSTRUCTION(ldvar_for_update_) {
             Immediate id = readImmediate();
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             R_varloc_t loc = R_findVarLocInFrame(env, cp_pool_at(ctx, id));
             bool isLocal = !R_VARLOC_IS_NULL(loc);
             SEXP res = nullptr;
@@ -2037,6 +2068,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             advanceImmediate();
             Immediate cacheIndex = readImmediate();
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             SEXP loc = getCellFromCache(env, id, cacheIndex, ctx, bindingCache);
             bool isLocal = loc;
             SEXP res = nullptr;
@@ -2105,7 +2137,9 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
         INSTRUCTION(ldvar_) {
             SEXP sym = readConst(ctx, readImmediate());
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = Rf_findVar(sym, env);
+            R_Visible = TRUE;
 
             recordForceBehavior(res);
 
@@ -2131,7 +2165,9 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             advanceImmediate();
             Immediate cacheIndex = readImmediate();
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = cachedGetVar(env, id, cacheIndex, ctx, bindingCache);
+            R_Visible = TRUE;
 
             if (res == R_UnboundValue) {
                 SEXP sym = cp_pool_at(ctx, id);
@@ -2157,6 +2193,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
         INSTRUCTION(ldvar_noforce_) {
             SEXP sym = readConst(ctx, readImmediate());
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = Rf_findVar(sym, env);
 
             if (res == R_UnboundValue) {
@@ -2178,6 +2215,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             advanceImmediate();
             Immediate cacheIndex = readImmediate();
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = cachedGetVar(env, id, cacheIndex, ctx, bindingCache);
 
             if (res == R_UnboundValue) {
@@ -2199,6 +2237,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
         INSTRUCTION(ldvar_super_) {
             SEXP sym = readConst(ctx, readImmediate());
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = Rf_findVar(sym, ENCLOS(env));
 
             if (res == R_UnboundValue) {
@@ -2223,6 +2262,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
         INSTRUCTION(ldvar_noforce_super_) {
             SEXP sym = readConst(ctx, readImmediate());
             advanceImmediate();
+            assert(!LazyEnvironment::check(env));
             res = Rf_findVar(sym, ENCLOS(env));
 
             if (res == R_UnboundValue) {
@@ -2587,11 +2627,15 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             auto fun = Function::unpack(version);
             addDynamicAssumptionsFromContext(call);
             bool dispatchFail = fun->dead || !matches(call, fun->signature());
+            fun->registerInvocation();
+            auto dt = DispatchTable::unpack(BODY(callee));
             if (!dispatchFail && !fun->unoptimizable &&
                 fun->deoptCount() < pir::Parameter::DEOPT_ABANDON &&
-                (fun->invocationCount() %
-                     ((fun->deoptCount() + 1) * pir::Parameter::RIR_WARMUP) ==
-                 0)) {
+                ((fun != dt->baseline() && fun->invocationCount() >= 2 &&
+                  fun->invocationCount() <= pir::Parameter::RIR_WARMUP) ||
+                 (fun->invocationCount() %
+                      ((fun->deoptCount() + 1) * pir::Parameter::RIR_WARMUP) ==
+                  0))) {
                 Assumptions assumptions =
                     addDynamicAssumptionsForOneTarget(call, fun->signature());
                 if (assumptions != fun->signature().assumptions)
@@ -2600,7 +2644,6 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             }
 
             if (dispatchFail) {
-                auto dt = DispatchTable::unpack(BODY(callee));
                 fun = dispatch(call, dt);
                 // Patch inline cache
                 (*(Immediate*)pc) = Pool::insert(fun->container());
@@ -2618,7 +2661,6 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
                 // by remembering the original order.
                 if (given.includes(Assumption::StaticallyArgmatched))
                     lazyArgs.content.args = nullptr;
-                fun->registerInvocation();
                 supplyMissingArgs(call, fun);
                 res = rirCallTrampoline(call, fun, symbol::delayedEnv,
                                         (SEXP)&lazyArgs, ctx);
@@ -2754,21 +2796,12 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             Immediate i = readImmediate();
             advanceImmediate();
             R_bcstack_t* pos = ostack_cell_at(ctx, 0);
-#ifdef TYPED_STACK
             SEXP val = pos->u.sxpval;
             while (i--) {
                 pos->u.sxpval = (pos - 1)->u.sxpval;
                 pos--;
             }
             pos->u.sxpval = val;
-#else
-            SEXP val = *pos;
-            while (i--) {
-                *pos = *(pos - 1);
-                pos--;
-            }
-            *pos = val;
-#endif
             NEXT();
         }
 
@@ -2776,21 +2809,12 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             Immediate i = readImmediate();
             advanceImmediate();
             R_bcstack_t* pos = ostack_cell_at(ctx, i);
-#ifdef TYPED_STACK
             SEXP val = pos->u.sxpval;
             while (i--) {
                 pos->u.sxpval = (pos + 1)->u.sxpval;
                 pos++;
             }
             pos->u.sxpval = val;
-#else
-            SEXP val = *pos;
-            while (i--) {
-                *pos = *(pos + 1);
-                pos++;
-            }
-            *pos = val;
-#endif
             NEXT();
         }
 
@@ -3588,7 +3612,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // intended, to avoid copying. Care need to be taken if `vec` is
             // used multiple times as a temporary.
             if (MAYBE_SHARED(vec)) {
-                vec = Rf_duplicate(vec);
+                vec = Rf_shallow_duplicate(vec);
                 ostack_set(ctx, 1, vec);
             }
 
@@ -3629,7 +3653,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // intended, to avoid copying. Care need to be taken if `vec` is
             // used multiple times as a temporary.
             if (MAYBE_SHARED(mtx)) {
-                mtx = Rf_duplicate(mtx);
+                mtx = Rf_shallow_duplicate(mtx);
                 ostack_set(ctx, 2, mtx);
             }
 
@@ -3673,7 +3697,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // intended, to avoid copying. Care need to be taken if `vec` is
             // used multiple times as a temporary.
             if (MAYBE_SHARED(mtx)) {
-                mtx = Rf_duplicate(mtx);
+                mtx = Rf_shallow_duplicate(mtx);
                 ostack_set(ctx, 2, mtx);
             }
 
@@ -3781,7 +3805,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // intended, to avoid copying. Care need to be taken if `vec` is
             // used multiple times as a temporary.
             if (MAYBE_SHARED(vec)) {
-                vec = Rf_duplicate(vec);
+                vec = Rf_shallow_duplicate(vec);
                 ostack_set(ctx, 1, vec);
             }
 
@@ -3895,7 +3919,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // intended, to avoid copying. Care need to be taken if `vec` is
             // used multiple times as a temporary.
             if (MAYBE_SHARED(mtx)) {
-                mtx = Rf_duplicate(mtx);
+                mtx = Rf_shallow_duplicate(mtx);
                 ostack_set(ctx, 2, mtx);
             }
 
@@ -3978,9 +4002,10 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             size_t stackHeight = 0;
             for (size_t i = 0; i < m->numFrames; ++i)
                 stackHeight += m->frames[i].stackSize + 1;
+            m->frames[m->numFrames - 1].code->registerDeopt();
             c->registerDeopt();
             deoptFramesWithContext(ctx, callCtxt, m, R_NilValue,
-                                   m->numFrames - 1, stackHeight, true);
+                                   m->numFrames - 1, stackHeight);
             assert(false);
         }
 
@@ -4083,7 +4108,7 @@ SEXP evalRirCode(Code* c, InterpreterInstance* ctx, SEXP env,
             // flag here. What we should do instead, is use a non-dispatching
             // extract BC.
             if (isObject(seq)) {
-                seq = Rf_duplicate(seq);
+                seq = Rf_shallow_duplicate(seq);
                 SET_OBJECT(seq, 0);
                 ostack_set(ctx, 0, seq);
             }

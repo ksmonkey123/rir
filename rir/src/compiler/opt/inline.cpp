@@ -4,6 +4,7 @@
 #include "../util/cfg.h"
 #include "../util/safe_builtins_list.h"
 #include "../util/visitor.h"
+#include "R/BuiltinIds.h"
 #include "R/Funtab.h"
 #include "R/Symbols.h"
 #include "R/r.h"
@@ -93,7 +94,7 @@ class TheInliner {
                                    Tombstone::closure()) {
                             static SEXP b = nullptr;
                             if (!b) {
-                                auto idx = findBuiltin("environment");
+                                auto idx = rir::blt("environment");
                                 b = Rf_allocSExp(BUILTINSXP);
                                 b->u.primsxp.offset = idx;
                                 R_PreserveObject(b);
@@ -178,6 +179,21 @@ class TheInliner {
                                      (double)Parameter::INLINER_MAX_SIZE;
                         limit = (limit * 4) + 1;
                         weight *= limit;
+                    }
+                    auto env = Env::Cast(inlineeCls->closureEnv());
+                    if (env && env->rho && R_IsNamespaceEnv(env->rho)) {
+                        auto expr = BODY_EXPR(inlineeCls->rirClosure());
+                        // Closure wrappers for internals
+                        if (CAR(expr) == rir::symbol::Internal)
+                            weight *= 0.6;
+                        // those usually strongly benefit type
+                        // inference, since they have a lot of case
+                        // distinctions
+                        static auto profitable =
+                            std::unordered_set<std::string>(
+                                {"matrix", "array", "vector"});
+                        if (profitable.count(inlineeCls->name()))
+                            weight *= 0.2;
                     }
                 }
 

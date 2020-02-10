@@ -31,11 +31,14 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/InductiveRangeCheckElimination.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/Transforms/Vectorize.h>
 
 #include <llvm/Transforms/IPO.h>
 #include <unordered_map>
+
+#include <iostream>
 
 namespace {
 
@@ -208,67 +211,80 @@ class JitLLVMImplementation {
 
 static void pirPassSchedule(const PassManagerBuilder&,
                             legacy::PassManagerBase& PM) {
-    // Cleanup code
-    PM.add(createCFGSimplificationPass());
-    PM.add(createDeadCodeEliminationPass());
-    PM.add(createSROAPass());
-    PM.add(createMemCpyOptPass());
-    PM.add(createPromoteMemoryToRegisterPass());
+    PM.add(createDeadInstEliminationPass());
 
-    // Some scalar opts
-    PM.add(createScopedNoAliasAAWrapperPass());
-    PM.add(createTypeBasedAAWrapperPass());
-    PM.add(createBasicAAWrapperPass());
+    PM.add(createCFGSimplificationPass());
+    PM.add(createSROAPass());
+    PM.add(createPromoteMemoryToRegisterPass());
 
     PM.add(createConstantPropagationPass());
     PM.add(createDeadInstEliminationPass());
 
-    PM.add(createInstructionCombiningPass());
-    PM.add(createCFGSimplificationPass());
-    PM.add(createSROAPass());
-    PM.add(createCFGSimplificationPass());
-    PM.add(createReassociatePass());
-
-    PM.add(createEarlyCSEPass());
-
-    PM.add(createCFGSimplificationPass());
-    PM.add(createReassociatePass());
-    PM.add(createEarlyCSEPass());
-
-    // Go after loops
-    PM.add(createPromoteMemoryToRegisterPass());
-
-    PM.add(createLoopIdiomPass());
-    PM.add(createLoopRotatePass());
     PM.add(createLICMPass());
     PM.add(createLoopUnswitchPass());
-    PM.add(createInstructionCombiningPass());
-    PM.add(createIndVarSimplifyPass());
-    PM.add(createLoopDeletionPass());
-    PM.add(createSimpleLoopUnrollPass());
-    PM.add(createLoopStrengthReducePass());
+    PM.add(createInductiveRangeCheckEliminationPass());
+    PM.add(createCFGSimplificationPass());
 
-    PM.add(createSROAPass());
     PM.add(createInstructionCombiningPass());
     PM.add(createGVNPass());
-    PM.add(createMemCpyOptPass());
     PM.add(createSCCPPass());
-
     PM.add(createSinkingPass());
-    PM.add(createInstructionCombiningPass());
-    PM.add(createJumpThreadingPass());
-    PM.add(createDeadStoreEliminationPass());
 
-    // Cleanup
+    PM.add(createLICMPass());
+    PM.add(createLoopUnswitchPass());
+    PM.add(createInductiveRangeCheckEliminationPass());
     PM.add(createCFGSimplificationPass());
-    PM.add(createLoopIdiomPass());
-    PM.add(createLoopDeletionPass());
-    PM.add(createJumpThreadingPass());
-    PM.add(createAggressiveDCEPass());
-    PM.add(createInstructionCombiningPass());
 
-    PM.add(createTailCallEliminationPass());
+    PM.add(createCFGSimplificationPass());
+    PM.add(createAggressiveDCEPass());
 }
+
+// Pass to run after hotCold splitting:
+// We use cold functions for bailout branches, thus we set the optnone attribute
+// on cold functions and uses the coldcc calling convention to call them.
+struct NooptCold : public ModulePass {
+    static char ID;
+    NooptCold() : ModulePass(ID) {}
+
+    bool runOnModule(Module& module) override {
+        bool changed = false;
+        for (auto& fun : module) {
+            if (fun.hasName()) {
+                if (fun.getName().contains(".cold.")) {
+                    if (!fun.hasFnAttribute(Attribute::OptimizeNone)) {
+                        fun.addAttribute(AttributeList::FunctionIndex,
+                                         Attribute::OptimizeNone);
+                        fun.setCallingConv(CallingConv::Cold);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (auto& fun : module) {
+            for (auto& bb : fun) {
+                for (auto& instr : bb) {
+                    if (CallInst* call = llvm::dyn_cast<CallInst>(&instr)) {
+                        if (call->getCallingConv() != CallingConv::Cold) {
+                            if (auto callee = call->getCalledFunction()) {
+                                if (callee->getCallingConv() ==
+                                    CallingConv::Cold) {
+                                    call->setCallingConv(CallingConv::Cold);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return changed;
+    }
+};
+
+char NooptCold::ID = 0;
+static RegisterPass<NooptCold> X("noopt-cold", "Don't optimize cold functions",
+                                 false /* Only looks at CFG */,
+                                 false /* Analysis Pass */);
 
 std::unique_ptr<llvm::Module>
 JitLLVMImplementation::optimizeModule(std::unique_ptr<llvm::Module> M) {
@@ -290,6 +306,12 @@ JitLLVMImplementation::optimizeModule(std::unique_ptr<llvm::Module> M) {
         // Start with some custom passes tailored to our backend
         builder.addExtension(PassManagerBuilder::EP_EarlyAsPossible,
                              pirPassSchedule);
+        builder.addExtension(
+            PassManagerBuilder::EP_ModuleOptimizerEarly,
+            [](const PassManagerBuilder&, PassManagerBase& PM) {
+                PM.add(createHotColdSplittingPass());
+                PM.add(new NooptCold());
+            });
 
         builder.populateFunctionPassManager(*PM);
         builder.populateModulePassManager(MPM);

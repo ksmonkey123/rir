@@ -54,7 +54,7 @@ class Context {
 class Pir2Rir {
   public:
     Pir2Rir(Pir2RirCompiler& cmp, ClosureVersion* cls, bool dryRun,
-            LogStream& log)
+            ClosureStreamLogger& log)
         : compiler(cmp), cls(cls), dryRun(dryRun), log(log) {}
     rir::Code* compileCode(Context& ctx, Code* code);
     rir::Code* getPromise(Context& ctx, Promise* code);
@@ -68,7 +68,7 @@ class Pir2Rir {
     ClosureVersion* cls;
     std::unordered_map<Promise*, rir::Code*> promises;
     bool dryRun;
-    LogStream& log;
+    ClosureStreamLogger& log;
 
     class CodeBuffer {
       private:
@@ -292,7 +292,7 @@ rir::Code* Pir2Rir::compileCode(Context& ctx, Code* code) {
     Visitor::run(code->entry,
                  [](Instruction* i) { i->updateTypeAndEffects(); });
 
-    SSAAllocator alloc(code, cls, log);
+    SSAAllocator alloc(code, cls, log.out());
     log.afterAllocator(code, [&](std::ostream& o) { alloc.print(o); });
     alloc.verify();
 
@@ -310,7 +310,7 @@ rir::Code* Pir2Rir::compileCode(Context& ctx, Code* code) {
             bbLabels[bb] = ctx.cs().mkLabel();
     });
 
-    LastEnv lastEnv(cls, code, log);
+    LastEnv lastEnv(cls, code, log.out());
     std::unordered_map<Value*, BC::Label> pushContexts;
     std::unordered_set<BC::Label> pushContextsPopped;
 
@@ -322,7 +322,7 @@ rir::Code* Pir2Rir::compileCode(Context& ctx, Code* code) {
 
     NeedsRefcountAdjustment refcount;
     {
-        StaticReferenceCount refcountAnalysis(cls, log);
+        StaticReferenceCount refcountAnalysis(cls, log.out());
         refcountAnalysis();
         refcount = refcountAnalysis.getGlobalState();
     }
@@ -784,34 +784,37 @@ rir::Code* Pir2Rir::compileCode(Context& ctx, Code* code) {
                 auto in = is->arg(0).val();
                 assert(!t.isVoid() && !t.maybeLazy());
 
-                if (t.isA(RType::logical)) {
+                if (t.noAttribs().isA(RType::logical)) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(BC::isType(TypeChecks::LogicalSimpleScalar));
                     else
                         cb.add(BC::isType(TypeChecks::LogicalNonObject));
-                } else if (t.isA(PirType(RType::logical).orPromiseWrapped())) {
+                } else if (t.noAttribs().isA(
+                               PirType(RType::logical).orPromiseWrapped())) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(
                             BC::isType(TypeChecks::LogicalSimpleScalarWrapped));
                     else
                         cb.add(BC::isType(TypeChecks::LogicalNonObjectWrapped));
-                } else if (t.isA(RType::integer)) {
+                } else if (t.noAttribs().isA(RType::integer)) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(BC::isType(TypeChecks::IntegerSimpleScalar));
                     else
                         cb.add(BC::isType(TypeChecks::IntegerNonObject));
-                } else if (t.isA(PirType(RType::integer).orPromiseWrapped())) {
+                } else if (t.noAttribs().isA(
+                               PirType(RType::integer).orPromiseWrapped())) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(
                             BC::isType(TypeChecks::IntegerSimpleScalarWrapped));
                     else
                         cb.add(BC::isType(TypeChecks::IntegerNonObjectWrapped));
-                } else if (t.isA(RType::real)) {
+                } else if (t.noAttribs().isA(RType::real)) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(BC::isType(TypeChecks::RealSimpleScalar));
                     else
                         cb.add(BC::isType(TypeChecks::RealNonObject));
-                } else if (t.isA(PirType(RType::real).orPromiseWrapped())) {
+                } else if (t.noAttribs().isA(
+                               PirType(RType::real).orPromiseWrapped())) {
                     if (t.isScalar() && !in->type.isScalar())
                         cb.add(BC::isType(TypeChecks::RealSimpleScalarWrapped));
                     else
@@ -831,7 +834,8 @@ rir::Code* Pir2Rir::compileCode(Context& ctx, Code* code) {
                                .isA(t)) {
                     cb.add(BC::isType(TypeChecks::NoAttribsExceptDimWrapped));
                 } else {
-                    t.print(std::cout);
+                    t.print(std::cerr);
+                    std::cerr << "\n";
                     assert(false && "IsType used for unsupported type check");
                 }
                 break;
